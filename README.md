@@ -80,12 +80,12 @@ comment looks like:
 >
 > Project: **com.example:my-app:1.0.0-SNAPSHOT**
 >
-> > ### 🚨 Breaking changes detected
-> >
-> > - **1** newly added dependency is `CRITICAL`
-> > - **7** new CVEs introduced by added dependencies
-> >
-> > See sections below for details.
+> ### 🚨 Breaking changes detected
+>
+> - **1** newly added dependency is `CRITICAL`
+> - **7** new CVEs introduced by added dependencies
+>
+> See sections below for details.
 >
 > ### Summary of changes
 >
