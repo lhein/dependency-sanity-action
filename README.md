@@ -38,10 +38,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0     # required: diff mode reads the base-branch pom via `git show`
-      - uses: lhein/dependency-sanity-action@v0.1.2
-        with:
-          pom-path: pom.xml
+      - uses: lhein/dependency-sanity-action@v0.1.3
 ```
+
+That's it — by default the action auto-detects which POMs to analyze
+(see [Auto-detection](#auto-detection) below). For most projects you
+don't need to set `pom-path` at all.
 
 Two non-obvious requirements:
 
@@ -55,7 +57,7 @@ Two non-obvious requirements:
 
 | Name | Description | Default |
 |---|---|---|
-| `pom-path` | Pom file(s) to analyze — comma-separated, each entry may be a glob (e.g. `modules/*/pom.xml`). | `pom.xml` |
+| `pom-path` | Pom file(s) to analyze. `auto` (default) discovers them automatically — see below. To override, pass a comma-separated list of paths/globs, e.g. `pom.xml,modules/*/pom.xml`. | `auto` |
 | `mode` | `diff` (PR-only) or `full` (entire tree). | `diff` |
 | `fail-on` | `none` / `critical` / `warning` / `cve` — the action exits non-zero when the condition is met. | `none` |
 | `include-transitive-test` | Follow transitive test-scope deps. Result tree gets much larger. | `false` |
@@ -120,6 +122,25 @@ block at the top of the comment whenever **any** of these conditions are met:
 The banner gives a one-line tally per condition so reviewers don't need to
 read the full report to know whether the PR introduces risk.
 
+## Auto-detection
+
+With the default `pom-path: auto`, the action figures out which POMs to
+analyze based on the run context:
+
+- **In diff mode (PR runs)**: only POMs touched by this PR
+  (`git diff --name-only base..head -- '*pom.xml'`). If no POM changed,
+  the workflow logs that and exits cleanly without posting a comment.
+- **In full mode (or non-PR runs)**: every `pom.xml` in the working tree,
+  excluding `target/`, `.git/`, `node_modules/`, and `build/`.
+
+Override by passing an explicit list/glob:
+
+```yaml
+- uses: lhein/dependency-sanity-action@v0.1.3
+  with:
+    pom-path: 'pom.xml, modules/*/pom.xml'
+```
+
 ## Modes
 
 - **diff** (default): compares the head pom against its base-branch version and only
@@ -139,14 +160,11 @@ Set `fail-on` to make the action fail the PR check when issues are found:
 
 ## Multi-module projects
 
-Pass a comma-separated list or a glob to `pom-path` and the action runs the
-analyzer per POM, aggregating the results into one comment:
-
-```yaml
-- uses: lhein/dependency-sanity-action@v0.1.2
-  with:
-    pom-path: 'pom.xml, modules/*/pom.xml'
-```
+For a multi-module Maven reactor the default `pom-path: auto` already
+does the right thing — in diff mode it runs the analyzer on the
+modules whose `pom.xml` changed and aggregates the reports into a
+single comment. Pass an explicit pattern only when you want to scope
+narrower or wider than that.
 
 ## How it works
 

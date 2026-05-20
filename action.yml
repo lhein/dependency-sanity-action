@@ -8,10 +8,14 @@ branding:
 inputs:
   pom-path:
     description: |
-      Pom file(s) to analyze. Comma-separated, each entry may be a glob
-      (e.g. "pom.xml" or "modules/*/pom.xml" or "pom.xml,api/pom.xml").
+      Pom file(s) to analyze. The default value `auto` discovers POMs
+      automatically: in diff mode, the POMs changed by this PR; in full
+      mode, every pom.xml in the repo (excluding target/, .git/, and
+      node_modules/). To override, pass a comma-separated list where
+      each entry may be a glob (e.g. "pom.xml" or "modules/*/pom.xml"
+      or "pom.xml,api/pom.xml").
     required: false
-    default: 'pom.xml'
+    default: 'auto'
   mode:
     description: 'Report mode: diff (PR-only changes) or full (entire tree).'
     required: false
@@ -70,24 +74,63 @@ runs:
       shell: bash
       env:
         PATTERNS: ${{ inputs.pom-path }}
+        MODE: ${{ inputs.mode }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: |
         set -euo pipefail
         shopt -s globstar nullglob
         declare -A seen
         ordered=()
-        IFS=',' read -ra parts <<<"$PATTERNS"
-        for raw in "${parts[@]}"; do
-          p="${raw#"${raw%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
-          [ -z "$p" ] && continue
-          for f in $p; do
-            if [ -f "$f" ] && [ -z "${seen[$f]:-}" ]; then
-              seen[$f]=1
-              ordered+=("$f")
-            fi
+
+        if [ -z "$PATTERNS" ] || [ "$PATTERNS" = "auto" ]; then
+          # Auto-detect mode.
+          if [ "$MODE" = "diff" ] && [ -n "${BASE_SHA:-}" ]; then
+            # Only POMs touched by this PR.
+            echo "Auto-detect: pom.xml files changed in this PR"
+            while IFS= read -r f; do
+              [ -n "$f" ] && [ -f "$f" ] || continue
+              if [ -z "${seen[$f]:-}" ]; then
+                seen[$f]=1; ordered+=("$f")
+              fi
+            done < <(git diff --name-only "${BASE_SHA}" HEAD -- '*pom.xml' || true)
+          else
+            # Full-mode (or no base SHA available): scan the working tree.
+            echo "Auto-detect: every pom.xml in the working tree"
+            while IFS= read -r f; do
+              [ -n "$f" ] && [ -f "$f" ] || continue
+              f="${f#./}"
+              if [ -z "${seen[$f]:-}" ]; then
+                seen[$f]=1; ordered+=("$f")
+              fi
+            done < <(find . -name pom.xml \
+                -not -path '*/.git/*' \
+                -not -path '*/target/*' \
+                -not -path '*/node_modules/*' \
+                -not -path '*/build/*' | sort)
+          fi
+        else
+          # Explicit user-supplied list / globs.
+          IFS=',' read -ra parts <<<"$PATTERNS"
+          for raw in "${parts[@]}"; do
+            p="${raw#"${raw%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+            [ -z "$p" ] && continue
+            for f in $p; do
+              if [ -f "$f" ] && [ -z "${seen[$f]:-}" ]; then
+                seen[$f]=1; ordered+=("$f")
+              fi
+            done
           done
-        done
+        fi
+
         if [ "${#ordered[@]}" = "0" ]; then
-          echo "::error::No POM files matched: $PATTERNS"
+          # In auto-detect diff mode, "no pom.xml changed" is a normal
+          # condition — skip the rest of the workflow gracefully.
+          if { [ -z "$PATTERNS" ] || [ "$PATTERNS" = "auto" ]; } && [ "$MODE" = "diff" ]; then
+            echo "No pom.xml files changed in this PR — skipping analysis."
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::No POM files matched: ${PATTERNS:-<auto>}"
           exit 1
         fi
         printf '%s\n' "${ordered[@]}" > /tmp/poms.txt
@@ -97,6 +140,7 @@ runs:
 
     - name: Run analyzer per POM
       id: analyze
+      if: steps.poms.outputs.count != '0'
       shell: bash
       env:
         MODE: ${{ inputs.mode }}
@@ -140,6 +184,7 @@ runs:
 
     - name: Aggregate reports
       id: aggregate
+      if: steps.poms.outputs.count != '0'
       shell: bash
       env:
         COUNT: ${{ steps.poms.outputs.count }}
@@ -169,7 +214,7 @@ runs:
         echo "report=$AGG" >> "$GITHUB_OUTPUT"
 
     - name: Post PR comment
-      if: github.event_name == 'pull_request'
+      if: github.event_name == 'pull_request' && steps.poms.outputs.count != '0'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -192,6 +237,7 @@ runs:
         gh api "repos/${REPO}/issues/${PR}/comments" -f body="$BODY"
 
     - name: Enforce fail-on policy
+      if: steps.poms.outputs.count != '0'
       shell: bash
       env:
         EXIT: ${{ steps.analyze.outputs.exit }}
