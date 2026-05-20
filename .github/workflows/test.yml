@@ -1,0 +1,38 @@
+name: Self-test
+
+# Verifies the action works against this repo's sample pom.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create a sample pom.xml
+        run: |
+          mkdir -p sample
+          cat > sample/pom.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-direct</artifactId>
+            <version>4.20.0</version>
+          </project>
+          EOF
+
+      - name: Run analyzer (full mode)
+        uses: ./
+        with:
+          pom-path: sample/pom.xml
+          mode: full
+          fail-on: none

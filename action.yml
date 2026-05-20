@@ -1,0 +1,148 @@
+name: 'Camel Sanity Analyzer'
+description: 'Analyze Maven dependencies of a pom.xml and post a health report as PR comment.'
+author: 'lhein'
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  pom-path:
+    description: 'Path to the pom.xml to analyze.'
+    required: false
+    default: 'pom.xml'
+  mode:
+    description: 'Report mode: diff (PR-only changes) or full (entire tree).'
+    required: false
+    default: 'diff'
+  fail-on:
+    description: 'Fail the build when this condition is met: none, critical, warning, cve.'
+    required: false
+    default: 'none'
+  include-transitive-test:
+    description: 'Follow transitive test-scope deps (much larger tree). Default false.'
+    required: false
+    default: 'false'
+  comment-mode:
+    description: 'PR comment behaviour: update (re-use the bot comment) or new (always add).'
+    required: false
+    default: 'update'
+  cli-version:
+    description: 'Version tag of camel-sanity-cli to download. Default latest published release.'
+    required: false
+    default: 'latest'
+  github-token:
+    description: 'Token used to post the PR comment. Defaults to GITHUB_TOKEN.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  report:
+    description: 'Path to the rendered markdown report file.'
+    value: ${{ steps.analyze.outputs.report }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    - name: Download camel-sanity-cli
+      shell: bash
+      env:
+        VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -euo pipefail
+        if [ "$VERSION" = "latest" ]; then
+          URL="https://github.com/lhein/camel-sanity-analyzer/releases/latest/download/camel-sanity-cli.jar"
+        else
+          URL="https://github.com/lhein/camel-sanity-analyzer/releases/download/${VERSION}/camel-sanity-cli.jar"
+        fi
+        echo "Downloading CLI from $URL"
+        curl -fL -o /tmp/camel-sanity-cli.jar "$URL"
+
+    - name: Resolve base pom for diff mode
+      id: base
+      if: inputs.mode == 'diff'
+      shell: bash
+      env:
+        POM: ${{ inputs.pom-path }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        if [ -z "${BASE_SHA:-}" ]; then
+          echo "::warning::no base SHA available — switching to full mode"
+          echo "fallback=full" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        TMP=$(mktemp)
+        if git show "${BASE_SHA}:${POM}" > "$TMP" 2>/dev/null; then
+          echo "base-pom=$TMP" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::pom not present on base ($BASE_SHA) — running full scan"
+          echo "fallback=full" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Run analyzer
+      id: analyze
+      shell: bash
+      env:
+        POM: ${{ inputs.pom-path }}
+        MODE: ${{ steps.base.outputs.fallback || inputs.mode }}
+        BASE_POM: ${{ steps.base.outputs.base-pom }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        INCLUDE_TEST: ${{ inputs.include-transitive-test }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        REPORT=$(mktemp --suffix=.md)
+        ARGS=("$POM" --output markdown --fail-on "$FAIL_ON" --output-file "$REPORT")
+        if [ "$MODE" = "diff" ] && [ -n "${BASE_POM:-}" ]; then
+          ARGS+=(--base "$BASE_POM" --mode diff)
+        else
+          ARGS+=(--mode full)
+        fi
+        if [ "$INCLUDE_TEST" = "true" ]; then
+          ARGS+=(--include-transitive-test)
+        fi
+        set +e
+        java -jar /tmp/camel-sanity-cli.jar "${ARGS[@]}"
+        EXIT=$?
+        set -e
+        echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+        echo "exit=$EXIT" >> "$GITHUB_OUTPUT"
+
+    - name: Post PR comment
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPORT: ${{ steps.analyze.outputs.report }}
+        MODE: ${{ inputs.comment-mode }}
+        PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        MARKER="<!-- camel-sanity-analyzer:${{ inputs.pom-path }} -->"
+        BODY="$MARKER"$'\n'"$(cat "$REPORT")"
+        if [ "$MODE" = "update" ]; then
+          EXISTING=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+              --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -1)
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" -f body="$BODY"
+            exit 0
+          fi
+        fi
+        gh api "repos/${REPO}/issues/${PR}/comments" -f body="$BODY"
+
+    - name: Enforce fail-on policy
+      shell: bash
+      env:
+        EXIT: ${{ steps.analyze.outputs.exit }}
+      run: |
+        if [ "$EXIT" != "0" ]; then
+          echo "::error::Analyzer reported issues matching fail-on=${{ inputs.fail-on }}"
+          exit "$EXIT"
+        fi
