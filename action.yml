@@ -1,5 +1,5 @@
-name: 'Camel Sanity Analyzer'
-description: 'Analyze Maven dependencies of a pom.xml and post a health report as PR comment.'
+name: 'Dependency Sanity Analyzer'
+description: 'Analyze Maven dependencies of pom.xml file(s) and post a health report as PR comment.'
 author: 'lhein'
 branding:
   icon: 'shield'
@@ -7,7 +7,9 @@ branding:
 
 inputs:
   pom-path:
-    description: 'Path to the pom.xml to analyze.'
+    description: |
+      Pom file(s) to analyze. Comma-separated, each entry may be a glob
+      (e.g. "pom.xml" or "modules/*/pom.xml" or "pom.xml,api/pom.xml").
     required: false
     default: 'pom.xml'
   mode:
@@ -37,8 +39,8 @@ inputs:
 
 outputs:
   report:
-    description: 'Path to the rendered markdown report file.'
-    value: ${{ steps.analyze.outputs.report }}
+    description: 'Path to the aggregated markdown report file.'
+    value: ${{ steps.aggregate.outputs.report }}
 
 runs:
   using: 'composite'
@@ -63,69 +65,121 @@ runs:
         echo "Downloading CLI from $URL"
         curl -fL -o /tmp/camel-sanity-cli.jar "$URL"
 
-    - name: Resolve base pom for diff mode
-      id: base
-      if: inputs.mode == 'diff'
+    - name: Expand POM paths
+      id: poms
       shell: bash
       env:
-        POM: ${{ inputs.pom-path }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PATTERNS: ${{ inputs.pom-path }}
       run: |
         set -euo pipefail
-        if [ -z "${BASE_SHA:-}" ]; then
-          echo "::warning::no base SHA available — switching to full mode"
-          echo "fallback=full" >> "$GITHUB_OUTPUT"
-          exit 0
+        shopt -s globstar nullglob
+        declare -A seen
+        ordered=()
+        IFS=',' read -ra parts <<<"$PATTERNS"
+        for raw in "${parts[@]}"; do
+          p="${raw#"${raw%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+          [ -z "$p" ] && continue
+          for f in $p; do
+            if [ -f "$f" ] && [ -z "${seen[$f]:-}" ]; then
+              seen[$f]=1
+              ordered+=("$f")
+            fi
+          done
+        done
+        if [ "${#ordered[@]}" = "0" ]; then
+          echo "::error::No POM files matched: $PATTERNS"
+          exit 1
         fi
-        TMP=$(mktemp)
-        if git show "${BASE_SHA}:${POM}" > "$TMP" 2>/dev/null; then
-          echo "base-pom=$TMP" >> "$GITHUB_OUTPUT"
-        else
-          echo "::warning::pom not present on base ($BASE_SHA) — running full scan"
-          echo "fallback=full" >> "$GITHUB_OUTPUT"
-        fi
+        printf '%s\n' "${ordered[@]}" > /tmp/poms.txt
+        echo "Matched ${#ordered[@]} POM file(s):"
+        cat /tmp/poms.txt
+        echo "count=${#ordered[@]}" >> "$GITHUB_OUTPUT"
 
-    - name: Run analyzer
+    - name: Run analyzer per POM
       id: analyze
       shell: bash
       env:
-        POM: ${{ inputs.pom-path }}
-        MODE: ${{ steps.base.outputs.fallback || inputs.mode }}
-        BASE_POM: ${{ steps.base.outputs.base-pom }}
+        MODE: ${{ inputs.mode }}
         FAIL_ON: ${{ inputs.fail-on }}
         INCLUDE_TEST: ${{ inputs.include-transitive-test }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
-        REPORT=$(mktemp --suffix=.md)
-        ARGS=("$POM" --output markdown --fail-on "$FAIL_ON" --output-file "$REPORT")
-        if [ "$MODE" = "diff" ] && [ -n "${BASE_POM:-}" ]; then
-          ARGS+=(--base "$BASE_POM" --mode diff)
-        else
-          ARGS+=(--mode full)
+        WORST_EXIT=0
+        REPORTS_DIR=$(mktemp -d)
+        echo "$REPORTS_DIR" > /tmp/reports-dir
+        while IFS= read -r pom; do
+          [ -z "$pom" ] && continue
+          report="$REPORTS_DIR/$(echo "$pom" | tr '/.' '__').md"
+          ARGS=("$pom" --output markdown --fail-on "$FAIL_ON" --output-file "$report")
+          if [ "$MODE" = "diff" ] && [ -n "${BASE_SHA:-}" ]; then
+            base_tmp=$(mktemp --suffix=.xml)
+            if git show "${BASE_SHA}:${pom}" > "$base_tmp" 2>/dev/null; then
+              ARGS+=(--base "$base_tmp" --mode diff)
+            else
+              echo "::warning::$pom not present on base — running full scan"
+              ARGS+=(--mode full)
+            fi
+          else
+            ARGS+=(--mode full)
+          fi
+          if [ "$INCLUDE_TEST" = "true" ]; then
+            ARGS+=(--include-transitive-test)
+          fi
+          echo "::group::analyze $pom"
+          set +e
+          java -jar /tmp/camel-sanity-cli.jar "${ARGS[@]}"
+          rc=$?
+          set -e
+          [ $rc -gt $WORST_EXIT ] && WORST_EXIT=$rc
+          echo "::endgroup::"
+          echo "$pom" > "${report}.path"
+        done < /tmp/poms.txt
+        echo "exit=$WORST_EXIT" >> "$GITHUB_OUTPUT"
+
+    - name: Aggregate reports
+      id: aggregate
+      shell: bash
+      env:
+        COUNT: ${{ steps.poms.outputs.count }}
+      run: |
+        set -euo pipefail
+        REPORTS_DIR=$(cat /tmp/reports-dir)
+        AGG=$(mktemp --suffix=.md)
+        if [ "$COUNT" -gt 1 ]; then
+          echo "## Dependency Sanity Analyzer — $COUNT POM files analyzed" > "$AGG"
+          echo "" >> "$AGG"
         fi
-        if [ "$INCLUDE_TEST" = "true" ]; then
-          ARGS+=(--include-transitive-test)
-        fi
-        set +e
-        java -jar /tmp/camel-sanity-cli.jar "${ARGS[@]}"
-        EXIT=$?
-        set -e
-        echo "report=$REPORT" >> "$GITHUB_OUTPUT"
-        echo "exit=$EXIT" >> "$GITHUB_OUTPUT"
+        first=true
+        for path_file in "$REPORTS_DIR"/*.md.path; do
+          [ -f "$path_file" ] || continue
+          pom_path=$(cat "$path_file")
+          report_file="${path_file%.path}"
+          if [ "$COUNT" -gt 1 ]; then
+            if [ "$first" != "true" ]; then echo "" >> "$AGG"; echo "---" >> "$AGG"; echo "" >> "$AGG"; fi
+            echo "## \`$pom_path\`" >> "$AGG"
+            echo "" >> "$AGG"
+            sed 's/^## Camel Sanity Analyzer.*//' "$report_file" >> "$AGG"
+          else
+            cat "$report_file" >> "$AGG"
+          fi
+          first=false
+        done
+        echo "report=$AGG" >> "$GITHUB_OUTPUT"
 
     - name: Post PR comment
       if: github.event_name == 'pull_request'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
-        REPORT: ${{ steps.analyze.outputs.report }}
+        REPORT: ${{ steps.aggregate.outputs.report }}
         MODE: ${{ inputs.comment-mode }}
         PR: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
       run: |
         set -euo pipefail
-        MARKER="<!-- camel-sanity-analyzer:${{ inputs.pom-path }} -->"
+        MARKER="<!-- dependency-sanity-analyzer -->"
         BODY="$MARKER"$'\n'"$(cat "$REPORT")"
         if [ "$MODE" = "update" ]; then
           EXISTING=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
