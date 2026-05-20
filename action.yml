@@ -160,7 +160,7 @@ runs:
             if [ "$first" != "true" ]; then echo "" >> "$AGG"; echo "---" >> "$AGG"; echo "" >> "$AGG"; fi
             echo "## \`$pom_path\`" >> "$AGG"
             echo "" >> "$AGG"
-            sed 's/^## Camel Sanity Analyzer.*//' "$report_file" >> "$AGG"
+            sed 's/^## Dependency Sanity Analyzer.*//' "$report_file" >> "$AGG"
           else
             cat "$report_file" >> "$AGG"
           fi
