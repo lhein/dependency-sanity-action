@@ -1,19 +1,27 @@
 name: 'Dependency Sanity Analyzer'
-description: 'Analyze Maven dependencies of pom.xml file(s) and post a health report as PR comment.'
+description: 'Analyze Maven & Gradle dependencies of build file(s) and post a health report as PR comment.'
 author: 'lhein'
 branding:
   icon: 'shield'
   color: 'green'
 
 inputs:
+  build-files:
+    description: |
+      Build file(s) to analyze. The default value `auto` discovers files
+      automatically: in diff mode, the build files changed by this PR;
+      in full mode, every pom.xml / build.gradle / build.gradle.kts in
+      the repo (excluding target/, build/, .git/, and node_modules/).
+      To override, pass a comma-separated list where each entry may be
+      a glob (e.g. "pom.xml" or "modules/*/build.gradle" or
+      "pom.xml,gradle-app/build.gradle.kts").
+    required: false
+    default: 'auto'
   pom-path:
     description: |
-      Pom file(s) to analyze. The default value `auto` discovers POMs
-      automatically: in diff mode, the POMs changed by this PR; in full
-      mode, every pom.xml in the repo (excluding target/, .git/, and
-      node_modules/). To override, pass a comma-separated list where
-      each entry may be a glob (e.g. "pom.xml" or "modules/*/pom.xml"
-      or "pom.xml,api/pom.xml").
+      Deprecated alias of `build-files`. Still honored for backwards
+      compatibility — if set to anything other than the default, it
+      overrides `build-files`. Prefer `build-files` for new workflows.
     required: false
     default: 'auto'
   mode:
@@ -69,40 +77,54 @@ runs:
         echo "Downloading CLI from $URL"
         curl -fL -o /tmp/camel-sanity-cli.jar "$URL"
 
-    - name: Expand POM paths
+    - name: Expand build-file paths
       id: poms
       shell: bash
       env:
-        PATTERNS: ${{ inputs.pom-path }}
+        BUILD_FILES: ${{ inputs.build-files }}
+        POM_PATH: ${{ inputs.pom-path }}
         MODE: ${{ inputs.mode }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: |
         set -euo pipefail
         shopt -s globstar nullglob
+
+        # Backwards-compatibility: honor the deprecated `pom-path` input if the
+        # user set it to anything other than the default. Otherwise prefer the
+        # new `build-files` input.
+        if [ -n "${POM_PATH:-}" ] && [ "$POM_PATH" != "auto" ]; then
+          echo "::warning::input 'pom-path' is deprecated; please migrate to 'build-files'."
+          PATTERNS="$POM_PATH"
+        else
+          PATTERNS="$BUILD_FILES"
+        fi
+
         declare -A seen
         ordered=()
+        has_gradle=false
 
         if [ -z "$PATTERNS" ] || [ "$PATTERNS" = "auto" ]; then
           # Auto-detect mode.
           if [ "$MODE" = "diff" ] && [ -n "${BASE_SHA:-}" ]; then
-            # Only POMs touched by this PR.
-            echo "Auto-detect: pom.xml files changed in this PR"
+            # Only build files touched by this PR.
+            echo "Auto-detect: build files changed in this PR (pom.xml / build.gradle / build.gradle.kts)"
             while IFS= read -r f; do
               [ -n "$f" ] && [ -f "$f" ] || continue
               if [ -z "${seen[$f]:-}" ]; then
                 seen[$f]=1; ordered+=("$f")
               fi
-            done < <(git diff --name-only "${BASE_SHA}" HEAD -- '*pom.xml' || true)
+            done < <(git diff --name-only "${BASE_SHA}" HEAD -- \
+                       '*pom.xml' '*build.gradle' '*build.gradle.kts' || true)
           else
             # Full-mode (or no base SHA available): scan the working tree.
-            echo "Auto-detect: every pom.xml in the working tree"
+            echo "Auto-detect: every build file in the working tree"
             while IFS= read -r f; do
               [ -n "$f" ] && [ -f "$f" ] || continue
               f="${f#./}"
               if [ -z "${seen[$f]:-}" ]; then
                 seen[$f]=1; ordered+=("$f")
               fi
-            done < <(find . -name pom.xml \
+            done < <(find . \( -name pom.xml -o -name build.gradle -o -name build.gradle.kts \) \
                 -not -path '*/.git/*' \
                 -not -path '*/target/*' \
                 -not -path '*/node_modules/*' \
@@ -122,23 +144,32 @@ runs:
           done
         fi
 
+        # Spot whether any Gradle build file made the list — used downstream
+        # to decide whether to provision a base-state worktree for diffing.
+        for f in "${ordered[@]:-}"; do
+          case "$(basename -- "$f")" in
+            build.gradle|build.gradle.kts) has_gradle=true ;;
+          esac
+        done
+
         if [ "${#ordered[@]}" = "0" ]; then
-          # In auto-detect diff mode, "no pom.xml changed" is a normal
+          # In auto-detect diff mode, "no build files changed" is a normal
           # condition — skip the rest of the workflow gracefully.
           if { [ -z "$PATTERNS" ] || [ "$PATTERNS" = "auto" ]; } && [ "$MODE" = "diff" ]; then
-            echo "No pom.xml files changed in this PR — skipping analysis."
+            echo "No build files changed in this PR — skipping analysis."
             echo "count=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "::error::No POM files matched: ${PATTERNS:-<auto>}"
+          echo "::error::No build files matched: ${PATTERNS:-<auto>}"
           exit 1
         fi
         printf '%s\n' "${ordered[@]}" > /tmp/poms.txt
-        echo "Matched ${#ordered[@]} POM file(s):"
+        echo "Matched ${#ordered[@]} build file(s):"
         cat /tmp/poms.txt
         echo "count=${#ordered[@]}" >> "$GITHUB_OUTPUT"
+        echo "has-gradle=${has_gradle}" >> "$GITHUB_OUTPUT"
 
-    - name: Run analyzer per POM
+    - name: Run analyzer per build file
       id: analyze
       if: steps.poms.outputs.count != '0'
       shell: bash
@@ -147,24 +178,60 @@ runs:
         FAIL_ON: ${{ inputs.fail-on }}
         INCLUDE_TEST: ${{ inputs.include-transitive-test }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HAS_GRADLE: ${{ steps.poms.outputs.has-gradle }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
         WORST_EXIT=0
         REPORTS_DIR=$(mktemp -d)
         echo "$REPORTS_DIR" > /tmp/reports-dir
+
+        # Gradle projects need a full base-state checkout to diff against
+        # (build.gradle alone isn't enough — settings.gradle, libs.versions.toml
+        # and sub-project layouts all participate in resolution). When any
+        # Gradle file is in the analysis set AND we are in diff mode, set up
+        # a detached worktree at the base SHA and tear it down on exit.
+        BASE_WORKTREE=""
+        if [ "$MODE" = "diff" ] && [ -n "${BASE_SHA:-}" ] && [ "$HAS_GRADLE" = "true" ]; then
+          BASE_WORKTREE=$(mktemp -d -t dsa-base-XXXXXX)
+          # mktemp creates the dir; git worktree refuses to use an existing one.
+          rm -rf "$BASE_WORKTREE"
+          if git worktree add --detach "$BASE_WORKTREE" "$BASE_SHA" 2>/dev/null; then
+            echo "Base-state worktree for Gradle diff: $BASE_WORKTREE"
+            trap 'git worktree remove --force "$BASE_WORKTREE" >/dev/null 2>&1 || true' EXIT
+          else
+            echo "::warning::Could not create base worktree at $BASE_SHA — Gradle files will run in full mode."
+            BASE_WORKTREE=""
+          fi
+        fi
+
         while IFS= read -r pom; do
           [ -z "$pom" ] && continue
           report="$REPORTS_DIR/$(echo "$pom" | tr '/.' '__').md"
           ARGS=("$pom" --output markdown --fail-on "$FAIL_ON" --output-file "$report")
+          base_kind="$(basename -- "$pom")"
           if [ "$MODE" = "diff" ] && [ -n "${BASE_SHA:-}" ]; then
-            base_tmp=$(mktemp --suffix=.xml)
-            if git show "${BASE_SHA}:${pom}" > "$base_tmp" 2>/dev/null; then
-              ARGS+=(--base "$base_tmp" --mode diff)
-            else
-              echo "::warning::$pom not present on base — running full scan"
-              ARGS+=(--mode full)
-            fi
+            case "$base_kind" in
+              build.gradle|build.gradle.kts)
+                # Gradle: locate the matching base file inside the worktree.
+                if [ -n "$BASE_WORKTREE" ] && [ -f "$BASE_WORKTREE/$pom" ]; then
+                  ARGS+=(--base "$BASE_WORKTREE/$pom" --mode diff)
+                else
+                  echo "::warning::$pom not present on base (or worktree missing) — running full scan"
+                  ARGS+=(--mode full)
+                fi
+                ;;
+              *)
+                # Maven: cheaper to grab the single file via git show.
+                base_tmp=$(mktemp --suffix=.xml)
+                if git show "${BASE_SHA}:${pom}" > "$base_tmp" 2>/dev/null; then
+                  ARGS+=(--base "$base_tmp" --mode diff)
+                else
+                  echo "::warning::$pom not present on base — running full scan"
+                  ARGS+=(--mode full)
+                fi
+                ;;
+            esac
           else
             ARGS+=(--mode full)
           fi
@@ -193,7 +260,7 @@ runs:
         REPORTS_DIR=$(cat /tmp/reports-dir)
         AGG=$(mktemp --suffix=.md)
         if [ "$COUNT" -gt 1 ]; then
-          echo "## Dependency Sanity Analyzer — $COUNT POM files analyzed" > "$AGG"
+          echo "## Dependency Sanity Analyzer — $COUNT build files analyzed" > "$AGG"
           echo "" >> "$AGG"
         fi
         first=true

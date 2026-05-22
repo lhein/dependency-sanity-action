@@ -1,6 +1,6 @@
 name: Self-test
 
-# Verifies the action works against this repo's sample pom.
+# Verifies the action works against a sample Maven and a sample Gradle project.
 on:
   pull_request:
   workflow_dispatch:
@@ -17,10 +17,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create a sample pom.xml
+      - name: Create a sample Maven project
         run: |
-          mkdir -p sample
-          cat > sample/pom.xml <<'EOF'
+          mkdir -p sample-maven
+          cat > sample-maven/pom.xml <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <project xmlns="http://maven.apache.org/POM/4.0.0">
             <modelVersion>4.0.0</modelVersion>
@@ -30,9 +30,26 @@ jobs:
           </project>
           EOF
 
-      - name: Run analyzer (full mode)
+      - name: Create a sample Gradle project
+        run: |
+          mkdir -p sample-gradle
+          cat > sample-gradle/settings.gradle <<'EOF'
+          rootProject.name = 'sample-gradle'
+          EOF
+          cat > sample-gradle/build.gradle <<'EOF'
+          plugins { id 'java-library' }
+          group = 'com.example'
+          version = '1.0.0-SNAPSHOT'
+          repositories { mavenCentral() }
+          dependencies {
+              implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.2'
+              implementation 'org.slf4j:slf4j-api:2.0.13'
+          }
+          EOF
+
+      - name: Run analyzer (full mode, Maven + Gradle in one comment)
         uses: ./
         with:
-          pom-path: sample/pom.xml
+          build-files: sample-maven/pom.xml, sample-gradle/build.gradle
           mode: full
           fail-on: none
